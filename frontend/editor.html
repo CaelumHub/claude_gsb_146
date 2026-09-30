@@ -255,6 +255,8 @@ engine.setShapesMap(shapes);
 const crdt = new CrdtClient(`c${(Math.random() * 1e6 | 0).toString(36)}${Date.now().toString(36)}`);
 const socket = new BoardSocket(boardId, { page: 'editor' });
 crdt.onOps = (ops) => socket.sendOps(ops);
+// 撤销/重做由服务端权威执行: 历史跨刷新/跨设备持久化, 逆操作带并发保护
+crdt.onUndoRequest = (direction) => socket.sendHistory(direction);
 
 const tools = new ToolManager({
   engine, crdt, socket, shapes,
@@ -267,6 +269,9 @@ const tools = new ToolManager({
     onPresence: (p) => socket.sendPresence(p),
     onSelectionChange: () => renderSelectionPanel(),
     onHistoryChange: () => updateHistoryButtons(),
+    onUndoBlocked: () => {
+      if (socket.status !== 'open') toast('离线时无法撤销, 重连后可继续', 'warn');
+    },
     onToolChange: (tool) => highlightTool(tool),
   },
 });
@@ -295,6 +300,8 @@ window.addEventListener('wb:conn-status', (e) => {
 function updateHistoryButtons() {
   $('btn-undo').disabled = !tools.crdt.canUndo();
   $('btn-redo').disabled = !tools.crdt.canRedo();
+  const last = tools.crdt.undoLabels[tools.crdt.undoLabels.length - 1];
+  $('btn-undo').title = last ? `撤销「${last}」 Ctrl+Z` : '撤销 Ctrl+Z';
 }
 
 function updateStats() {
@@ -427,8 +434,14 @@ $('selection-actions').querySelectorAll('[data-act]').forEach((btn) => {
 });
 
 /* ---------------------------------------------------------------- 顶栏动作 */
-$('btn-undo').onclick = () => { tools.undo(); afterLocalChange(); };
-$('btn-redo').onclick = () => { tools.redo(); afterLocalChange(); };
+$('btn-undo').onclick = () => {
+  if (!tools.undo() && socket.status !== 'open') toast('离线时无法撤销, 重连后可继续', 'warn');
+  afterLocalChange();
+};
+$('btn-redo').onclick = () => {
+  if (!tools.redo() && socket.status !== 'open') toast('离线时无法重做, 重连后可继续', 'warn');
+  afterLocalChange();
+};
 $('btn-zoom-in').onclick = () => { engine.zoomAt(1.25, engine.width / 2, engine.height / 2); updateZoomLabel(); };
 $('btn-zoom-out').onclick = () => { engine.zoomAt(0.8, engine.width / 2, engine.height / 2); updateZoomLabel(); };
 $('btn-zoom-fit').onclick = () => { engine.fitToContent(); updateZoomLabel(); };
@@ -553,6 +566,7 @@ socket.on('welcome', async (msg) => {
   if (tools.readOnly) {
     toast(myRole === 'commenter' ? '你是评论成员: 可查看与聊天, 不可编辑' : '你是只读成员: 仅可查看', 'warn', 4200);
   }
+  if (msg.undo) crdt.setServerHistory(msg.undo);
   if (!engine._userMoved) { engine.fitToContent(); }
   engine.markDirty();
   updateStats();
@@ -564,6 +578,10 @@ socket.on('ops', (msg) => {
   const touched = mergeOps(shapes, msg.ops || []);
   invalidateFromOps(msg.ops || []);
   engine.onShapesChanged(touched);
+  // 撤销/重做产生的操作回到发起者: 修复索引/选中态与按钮(其他客户端只正常合并)
+  const byMe = msg.by === me.username;
+  const isHistory = (msg.ops || []).some((op) => op.origin === 'undo' || op.origin === 'redo');
+  if (byMe && isHistory) tools.afterServerHistory();
   updateStats();
   scheduleThumbnail();
 });
@@ -615,10 +633,32 @@ socket.on('fatal', async (msg) => {
   }
 });
 
+crdt.onHistory = () => updateHistoryButtons();
+
 crdt.onOps = (ops) => {
   socket.sendOps(ops);
   updateStats();
 };
+
+// 服务端撤销/重做结果: 深度以服务端为准; 逆操作本身经 ops 广播合并
+socket.on('undo_result', (msg) => {
+  crdt.setServerHistory({ undo_depth: msg.undo, redo_depth: msg.redo,
+                          last_label: msg.label });
+  if (!msg.ok) {
+    if (msg.reason === 'empty') toast('没有可撤销的操作', 'info');
+  } else if (msg.applied === 0 && msg.reason === 'conflict') {
+    toast('该操作与他人的并发编辑冲突, 已跳过可安全撤销的部分', 'warn', 3600);
+  } else if (msg.label) {
+    toast(`${msg.direction === 'undo' ? '已撤销' : '已重做'}「${msg.label}」`, 'success', 1600);
+  }
+});
+
+// 同一账号在其他标签/设备撤销重做 → 同步本页按钮深度
+socket.on('undo_push', (msg) => {
+  if (msg.user !== me.username) return;
+  crdt.setServerHistory({ undo_depth: msg.undo, redo_depth: msg.redo,
+                          last_label: msg.last_label });
+});
 
 /* ---------------------------------------------------------------- 初始加载 */
 try {

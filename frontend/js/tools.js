@@ -150,6 +150,7 @@ export class ToolManager {
         mode: 'resize', handle, id,
         before: { x: shape.x, y: shape.y, w: shape.w, h: shape.h },
         moved: false,
+        group: this.crdt.beginGroup('缩放'),
       };
       this.engine.topCanvas.setPointerCapture(e.pointerId);
       return;
@@ -192,6 +193,7 @@ export class ToolManager {
         lastSend: 0,
         ids: [...this.engine.selection],
         moved: false,
+        gid: this.crdt.beginGroup('移动').gid,
       };
       this.engine.markDirty('overlay');
       return;
@@ -214,8 +216,11 @@ export class ToolManager {
     shape._path2d = null;
     this.shapes.set(shape.id, shape);
     this.engine.gridIndex.insert(shape);
-    this.crdt.send(this.shapes, [this.crdt.addShape(stripPrivate(shape))]);
-    this._drag = { mode: 'pen', id: shape.id, lastExtend: 0, pendingPts: [], lastPt: [0, 0] };
+    // 起笔 add_shape 与随后的续笔/收笔同属一个撤销组(服务端一步撤销整笔手绘)
+    const group = this.crdt.beginGroup('手绘');
+    this.crdt.send(this.shapes, [this.crdt.addShape(stripPrivate(shape))], group);
+    this._drag = { mode: 'pen', id: shape.id, lastExtend: 0, pendingPts: [],
+      lastPt: [0, 0], gid: group.gid, label: group.label };
     this.engine.markDirty('main');
   }
 
@@ -283,7 +288,7 @@ export class ToolManager {
   }
 
   _eraserDown(hitShape) {
-    this._drag = { mode: 'eraser', erased: [] };
+    this._drag = { mode: 'eraser', erased: [], ...this.crdt.beginGroup('擦除') };
     if (hitShape) this._eraseOne(hitShape);
   }
 
@@ -370,7 +375,8 @@ export class ToolManager {
           const dy = drag.accum.dy - drag.sent.dy;
           if (Math.abs(dx) > 0.01 || Math.abs(dy) > 0.01) {
             const ops = drag.ids.map((id) => this.crdt.move(id, dx, dy));
-            this._sendRaw(ops);
+            // 拖动分片同属一个撤销组, 服务端聚合成一步(逆操作=反向累计位移)
+            this._sendRaw(ops, { gid: drag.gid, label: '移动' });
             drag.sent = { dx: drag.accum.dx, dy: drag.accum.dy };
             drag.lastSend = now;
           }
@@ -409,7 +415,8 @@ export class ToolManager {
         drag.pendingPts.push(rel);
         const now = performance.now();
         if (now - drag.lastExtend > 90 && drag.pendingPts.length) {
-          this._sendRaw([this.crdt.pathExtend(shape.id, drag.pendingPts)]);
+          this._sendRaw([this.crdt.pathExtend(shape.id, drag.pendingPts)],
+            { gid: drag.gid, label: drag.label });
           drag.pendingPts = [];
           drag.lastExtend = now;
         }
@@ -463,31 +470,24 @@ export class ToolManager {
         break;
       case 'move':
         if (drag.moved) {
-          // 补发最后一段未广播的位移
+          // 补发最后一段未广播的位移(与节流帧同一撤销组)
           const dx = drag.accum.dx - drag.sent.dx;
           const dy = drag.accum.dy - drag.sent.dy;
           if (Math.abs(dx) > 0.01 || Math.abs(dy) > 0.01) {
-            this._sendRaw(drag.ids.map((id) => this.crdt.move(id, dx, dy)));
+            this._sendRaw(drag.ids.map((id) => this.crdt.move(id, dx, dy)),
+              { gid: drag.gid, label: '移动' });
           }
-          // 撤销栈: 一步撤销整个拖动(逆操作 = 每个图形的反向累计位移)
-          const undoOps = drag.ids.map((id) => ({ type: 'move', id, dx: -drag.accum.dx, dy: -drag.accum.dy }));
-          const redoOps = drag.ids.map((id) => ({ type: 'move', id, dx: drag.accum.dx, dy: drag.accum.dy }));
-          this.crdt.undoStack.push({ undoOps, redoOps, label: '移动' });
-          this.crdt.redoStack.length = 0;
           this.engine.markDirty('overlay');
         }
         break;
       case 'resize': {
         const shape = this.shapes.get(drag.id);
         if (shape && drag.moved) {
-          const b = drag.before;
           const props = { x: shape.x, y: shape.y, w: shape.w, h: shape.h };
-          const semantic = { type: 'set_props', id: drag.id, props };
-          const inverse = { type: 'set_props', id: drag.id, props: { x: b.x, y: b.y, w: b.w, h: b.h } };
-          // 单次签发: 本地合并与网络发送使用同一个操作对象, 保证字段时钟一致
-          this.crdt.send(this.shapes, [this.crdt.setProps(drag.id, props)]);
-          this.crdt.undoStack.push({ undoOps: [inverse], redoOps: [semantic], label: '缩放' });
-          this.crdt.redoStack.length = 0;
+          // 单次签发: 本地合并与网络发送使用同一个操作对象, 保证字段时钟一致;
+          // 撤销组在服务端记录逆操作(pointerdown 时建组)
+          this.crdt.send(this.shapes, [this.crdt.setProps(drag.id, props)],
+            { gid: drag.group.gid, label: drag.group.label });
         }
         this.engine.markDirty('overlay');
         break;
@@ -496,13 +496,9 @@ export class ToolManager {
         const shape = this.shapes.get(drag.id);
         if (shape) {
           if (drag.pendingPts.length) {
-            this._sendRaw([this.crdt.pathExtend(shape.id, drag.pendingPts)]);
+            this._sendRaw([this.crdt.pathExtend(shape.id, drag.pendingPts)],
+              { gid: drag.gid, label: drag.label });
           }
-          const fullShape = stripPrivate(shape);
-          const undoOps = [{ type: 'delete_shape', id: shape.id }];
-          const redoOps = [{ type: 'add_shape', shape: fullShape }];
-          this.crdt.undoStack.push({ undoOps, redoOps, label: '手绘' });
-          this.crdt.redoStack.length = 0;
           this.engine.selection = new Set([shape.id]);
           this._notifySelection();
         }
@@ -556,13 +552,9 @@ export class ToolManager {
       case 'eraser': {
         if (drag.erased.length) {
           const ids = [...drag.erased];
-          this._sendRaw(ids.map((id) => this.crdt.deleteShape(id)));
-          this.crdt.undoStack.push({
-            undoOps: ids.map((id) => ({ type: 'restore_shape', id })),
-            redoOps: ids.map((id) => ({ type: 'delete_shape', id })),
-            label: '擦除',
-          });
-          this.crdt.redoStack.length = 0;
+          // 擦除为一个撤销组(服务端一步恢复); 本地已乐观置 deleted
+          this._sendRaw(ids.map((id) => this.crdt.deleteShape(id)),
+            { gid: drag.gid, label: '擦除' });
           for (const id of ids) this.engine.selection.delete(id);
           this.engine.markDirty();
         }
@@ -572,14 +564,29 @@ export class ToolManager {
     }
   }
 
-  /** 发送一批已带信封的操作(合并到本地 + 交给 onOps 发送), 不产生撤销记录 */
-  _sendRaw(ops) {
+  /**
+   * 发送一批已带信封的操作(合并到本地 + 交给 onOps 发送)。
+   * @param {object[]} ops
+   * @param {{gid?:string, label?:string}} [group] 撤销组标记(手势分片复用同组)
+   */
+  _sendRaw(ops, group = null) {
     const list = ops.filter(Boolean);
     if (!list.length) return;
+    if (group?.gid) {
+      for (const op of list) {
+        op.ug = group.gid;
+        if (group.label) op.ulabel = group.label;
+      }
+    }
     mergeOps(this.shapes, list);
     if (this.crdt.onOps) {
       if (list.length === 1) this.crdt.onOps(list);
-      else this.crdt.onOps([{ ...this.crdt._next(), type: 'batch', ts: Date.now(), base_rev: 0, ops: list }]);
+      else {
+        const head = { ...this.crdt._next(), type: 'batch', ts: Date.now(), base_rev: 0, ops: list };
+        const g = list.find((o) => o.ug);
+        if (g?.ug) { head.ug = g.ug; if (g.ulabel) head.ulabel = g.ulabel; }
+        this.crdt.onOps([head]);
+      }
     }
   }
 
@@ -612,8 +619,14 @@ export class ToolManager {
       }
       if (this._isTyping(e)) return;
       const mod = e.ctrlKey || e.metaKey;
-      if (mod && e.key.toLowerCase() === 'z' && !e.shiftKey) { this.undo(); e.preventDefault(); return; }
-      if ((mod && e.key.toLowerCase() === 'y') || (mod && e.shiftKey && e.key.toLowerCase() === 'z')) { this.redo(); e.preventDefault(); return; }
+      if (mod && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        if (!this.undo()) this._notifyUndoOffline();
+        e.preventDefault(); return;
+      }
+      if ((mod && e.key.toLowerCase() === 'y') || (mod && e.shiftKey && e.key.toLowerCase() === 'z')) {
+        if (!this.redo()) this._notifyUndoOffline();
+        e.preventDefault(); return;
+      }
       if (mod && e.key.toLowerCase() === 'c') { this.copy(); e.preventDefault(); return; }
       if (mod && e.key.toLowerCase() === 'v') { this.paste(); e.preventDefault(); return; }
       if (mod && e.key.toLowerCase() === 'd') { this.duplicate(); e.preventDefault(); return; }
@@ -656,25 +669,36 @@ export class ToolManager {
   }
 
   /* ------------------------------------------------------------ 编辑动作 */
+  /**
+   * 撤销/重做: 由服务端权威执行(带并发保护, 历史跨设备持久化)。
+   * 本端不乐观应用 —— 服务端生成的逆操作经 ops 广播回来后统一合并,
+   * 页面在 onHistoryChange / onServerHistory 回调中刷新索引与选中态。
+   * @returns {boolean} 请求是否已发出(离线/空栈时 false)
+   */
   undo() {
-    if (this.readOnly) return;
-    const entry = this.crdt.undo(this.shapes);
-    if (entry) {
-      for (const id of this.engine.selection) if (!this.shapes.get(id) || this.shapes.get(id).deleted) this.engine.selection.delete(id);
-      this.engine.rebuildIndex();
-      this.engine.markDirty();
-      if (this.opts.onHistoryChange) this.opts.onHistoryChange();
-    }
+    if (this.readOnly || !this.crdt.canUndo()) return false;
+    return this.crdt.requestUndo();
   }
 
   redo() {
-    if (this.readOnly) return;
-    const entry = this.crdt.redo(this.shapes);
-    if (entry) {
-      this.engine.rebuildIndex();
-      this.engine.markDirty();
-      if (this.opts.onHistoryChange) this.opts.onHistoryChange();
+    if (this.readOnly || !this.crdt.canRedo()) return false;
+    return this.crdt.requestRedo();
+  }
+
+  /** 服务端撤销/重做的 ops 广播合并完成后, 统一修复索引与选中态 */
+  afterServerHistory() {
+    for (const id of [...this.engine.selection]) {
+      const s = this.shapes.get(id);
+      if (!s || s.deleted) this.engine.selection.delete(id);
     }
+    this.engine.rebuildIndex();
+    this.engine.markDirty();
+    if (this.opts.onHistoryChange) this.opts.onHistoryChange();
+  }
+
+  _notifyUndoOffline() {
+    // 离线或栈为空: 页面可注入提示回调(无回调时静默, 与只读页兼容)
+    if (this.opts.onUndoBlocked) this.opts.onUndoBlocked();
   }
 
   deleteSelection() {

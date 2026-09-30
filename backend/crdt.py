@@ -248,6 +248,14 @@ def validate_op(op: Any) -> Optional[Dict[str, Any]]:
         "type": op_type,
         "base_rev": int(_finite_number(op.get("base_rev"), 2**40) or 0),
     }
+    # 撤销分组标记(可选): 同一撤销动作的叶子带相同 ug; ulabel 为中文标签。
+    # 服务端撤销栈据此按 (白板, 用户) 聚合同一步, 见 backend/undo.py。
+    ug = str(op.get("ug") or "")[:80]
+    if ug:
+        clean["ug"] = ug
+        label = str(op.get("ulabel") or "")[:40]
+        if label:
+            clean["ulabel"] = label
     if op_type == "batch":
         subs = op.get("ops")
         if not isinstance(subs, list) or not subs or len(subs) > 512:
@@ -256,6 +264,11 @@ def validate_op(op: Any) -> Optional[Dict[str, Any]]:
         for sub in subs:
             cs = validate_op(sub)
             if cs and cs["type"] != "batch":       # 禁止嵌套 batch
+                # 子操作缺省继承外层 batch 的分组/标签(客户端手势分片)
+                if ug and not cs.get("ug"):
+                    cs["ug"] = ug
+                    if clean.get("ulabel") and not cs.get("ulabel"):
+                        cs["ulabel"] = clean["ulabel"]
                 clean_subs.append(cs)
         if not clean_subs:
             return None
@@ -277,8 +290,10 @@ def validate_op(op: Any) -> Optional[Dict[str, Any]]:
         dy = _finite_number(op.get("dy"))
         if not target or dx is None or dy is None:
             return None
-        if dx == 0 or dy == 0:
-            return None                            # 空移动直接丢弃
+        # 仅丢弃完全为零的移动; 单轴移动(dx=0 或 dy=0)是合法增量 —— 纯水平/
+        # 垂直拖动及其逆操作必须生效(move 是逐轴可交换增量, 与前端一致)。
+        if dx == 0 and dy == 0:
+            return None
         clean.update({"id": target, "dx": dx, "dy": dy})
     elif op_type == "set_props":
         target = str(op.get("id") or "")[:64]
@@ -432,9 +447,11 @@ class BoardDoc:
             shape = self._placeholder(target_id)
 
         if kind == "move":
-            # 增量对已删除图形同样累计(复活后位置正确, 且满足交换律)
-            shape["x"] = round(float(shape.get("x") or 0) + float(op["dy"]), 6)
-            shape["y"] = round(float(shape.get("y") or 0) + float(op["dx"]), 6)
+            # 增量对已删除图形同样累计(复活后位置正确, 且满足交换律)。
+            # dx→x / dy→y, 与前端 mergeOp 的 move 分支严格一致(此前轴互换会
+            # 导致服务端重建出的坐标与各客户端镜像不一致)。
+            shape["x"] = round(float(shape.get("x") or 0) + float(op["dx"]), 6)
+            shape["y"] = round(float(shape.get("y") or 0) + float(op["dy"]), 6)
             return True
 
         if kind == "path_extend":

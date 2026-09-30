@@ -174,6 +174,9 @@ engine.setShapesMap(shapes);
 const crdt = new CrdtClient(`m${(Math.random() * 1e6 | 0).toString(36)}${Date.now().toString(36)}`);
 const socket = new BoardSocket(boardId, { page: 'mindmap' });
 crdt.onOps = (ops) => { socket.sendOps(ops); updateStatus(); };
+// 撤销/重做服务端权威: 跨设备持久化, 逆操作带并发保护
+crdt.onUndoRequest = (direction) => socket.sendHistory(direction);
+crdt.onHistory = () => updateHistoryButtons();
 
 const tools = new ToolManager({
   engine, crdt, socket, shapes,
@@ -187,6 +190,7 @@ const tools = new ToolManager({
       else controller.renderOutline();
     },
     onHistoryChange: () => { updateHistoryButtons(); controller.renderOutline(); updateStatus(); },
+    onUndoBlocked: () => { if (socket.status !== 'open') toast('离线时无法撤销, 重连后可继续', 'warn'); },
   },
 });
 // 只保留选择/平移两个工具
@@ -221,8 +225,14 @@ $('direction').onchange = (e) => {
   setTimeout(updateMinimap, 300);
 };
 $('btn-boardmode').onclick = () => { location.href = `/editor.html?board=${boardId}`; };
-$('btn-undo').onclick = () => { tools.undo(); afterChange(true); };
-$('btn-redo').onclick = () => { tools.redo(); afterChange(true); };
+$('btn-undo').onclick = () => {
+  if (!tools.undo() && socket.status !== 'open') toast('离线时无法撤销, 重连后可继续', 'warn');
+  afterChange(true);
+};
+$('btn-redo').onclick = () => {
+  if (!tools.redo() && socket.status !== 'open') toast('离线时无法重做, 重连后可继续', 'warn');
+  afterChange(true);
+};
 $('btn-zoom-in').onclick = () => engine.zoomAt(1.25, engine.width / 2, engine.height / 2);
 $('btn-zoom-out').onclick = () => engine.zoomAt(0.8, engine.width / 2, engine.height / 2);
 $('btn-zoom-fit').onclick = () => { engine.fitToContent(120); updateMinimap(); };
@@ -325,6 +335,7 @@ socket.on('welcome', (msg) => {
     toast('当前角色只读, 无法编辑导图', 'warn');
   }
   if (!controller.rootNode() && !tools.readOnly) controller.ensureRoot();
+  if (msg.undo) crdt.setServerHistory(msg.undo);
   controller.renderOutline();
   engine.fitToContent(120);
   afterChange();
@@ -334,10 +345,25 @@ socket.on('ops', (msg) => {
   for (const op of msg.ops || []) crdt.witness(op);
   const touched = mergeOps(shapes, msg.ops || []);
   engine.onShapesChanged(touched);
-  if (structuralOps(msg.ops)) controller.onRemoteStructuralChange();
+  const isHistory = (msg.ops || []).some((op) => op.origin === 'undo' || op.origin === 'redo');
+  if (msg.by === me.username && isHistory) {
+    tools.afterServerHistory();
+    controller.onRemoteStructuralChange();
+  } else if (structuralOps(msg.ops)) controller.onRemoteStructuralChange();
   else controller.renderOutline();
   updateStatus();
   setTimeout(updateMinimap, 200);
+});
+
+socket.on('undo_result', (msg) => {
+  crdt.setServerHistory({ undo_depth: msg.undo, redo_depth: msg.redo, last_label: msg.label });
+  if (msg.ok && msg.applied === 0 && msg.reason === 'conflict') {
+    toast('该操作与他人的并发编辑冲突, 已跳过', 'warn', 3000);
+  }
+});
+socket.on('undo_push', (msg) => {
+  if (msg.user !== me.username) return;
+  crdt.setServerHistory({ undo_depth: msg.undo, redo_depth: msg.redo, last_label: msg.last_label });
 });
 
 socket.on('ack', () => updateStatus());

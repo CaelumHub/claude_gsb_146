@@ -94,7 +94,10 @@ class BoardHistory:
                 break
             for rec in self.log.read_shard(meta["name"]):
                 rev = rec.get("rev") or 0
-                if rev > from_rev and (to_rev is None or rev <= to_rev) and rec.get("type") != "move":
+                # 客户端高频 move 从不入日志; 这里能出现的 move 只可能是
+                # 服务端撤销/重做代发的权威逆增量(origin=undo/redo), 必须参与
+                # 补发与重建, 因此不再按类型过滤。
+                if rev > from_rev and (to_rev is None or rev <= to_rev):
                     out.append(rec)
                     if limit and len(out) >= limit:
                         return out

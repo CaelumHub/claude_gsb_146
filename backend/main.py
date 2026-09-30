@@ -27,6 +27,7 @@ from .models import (LoginReq, RegisterReq, SettingsPatchReq, UserPatchReq)
 from .replay import router as replay_router
 from .storage import dir_size, now_ms, read_json
 from .templates import router as templates_router
+from .undo import undo_service
 from .ws import conn_manager
 from .ws import router as ws_router
 
@@ -218,6 +219,15 @@ async def on_startup() -> None:
     seed.seed_if_empty()
     asyncio.create_task(conn_manager.heartbeat_loop())
     asyncio.create_task(_background_tasks())
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    # 进程退出前把撤销/重做栈与站点归属表落盘, 重启后用户仍可继续撤销
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, undo_service.flush_all)
+    except Exception:                                        # noqa: BLE001
+        pass
 
 
 @app.exception_handler(Exception)

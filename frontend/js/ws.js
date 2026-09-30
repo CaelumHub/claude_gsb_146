@@ -261,5 +261,13 @@ export class BoardSocket {
 
   sendPresence(payload) { return this._send({ type: 'presence', ...payload }); }
 
+  /** 请求服务端撤销/重做; 离线时不入队(返回 false), 由 UI 提示 */
+  sendHistory(direction, opts = {}) {
+    if (this.status !== 'open') return false;
+    const msg = { type: direction === 'redo' ? 'redo' : 'undo' };
+    if (opts.gid) msg.gid = opts.gid;
+    return this._send(msg);
+  }
+
   sendHello(page) { return this._send({ type: 'hello', page: page || this.page, client_id: this.clientId, last_rev: this.lastRev }); }
 }

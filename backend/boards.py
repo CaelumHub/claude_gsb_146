@@ -10,6 +10,7 @@ BoardManager 职责:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import secrets
 import time
@@ -24,6 +25,7 @@ from .models import (BoardCreateReq, BoardPatchReq, DuplicateReq,
                      PermissionsReq)
 from .storage import (now_ms, read_json, safe_id, write_json_atomic,
                       write_json_atomic_async)
+from .undo import undo_service, register_site
 
 router = APIRouter(prefix="/api/boards", tags=["boards"])
 
@@ -34,6 +36,38 @@ def new_board_id() -> str:
 
 def new_op_id_site() -> str:
     return "srv-" + secrets.token_hex(4)
+
+
+def _snapshot_before(doc: BoardDoc, leaves: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """应用一批叶子操作前, 拷贝受影响图形的当前状态(生成逆操作/赢家判定用)。
+
+    与 backend/undo.UndoStore._build_leaf 对应: set_props 可能触及任意 LWW
+    字段并需要其旧值, 因此只要某图形被本批中的任一 set_props 命中就整体拷贝;
+    其余操作只需运动/结构字段。
+    """
+    fields = {"x", "y", "w", "h", "z", "parent", "deleted", "points"}
+    full_ids = {
+        (op.get("id") or (op.get("shape") or {}).get("id"))
+        for op in leaves if op.get("type") == "set_props"
+    }
+    full_ids.discard(None)
+    out: Dict[str, Dict[str, Any]] = {}
+    for op in leaves:
+        sid = op.get("id") or (op.get("shape") or {}).get("id")
+        if not sid or sid in out:
+            continue
+        shape = doc.shapes.get(sid)
+        if shape is None:
+            continue
+        if sid in full_ids:
+            snap = {k: v for k, v in shape.items()}       # 含 fc 与任意 LWW 字段
+        else:
+            snap = {k: shape.get(k) for k in fields if k in shape}
+            snap["fc"] = shape.get("fc") or {}
+        out[sid] = snap
+    # 深拷贝可变值(points/fc/props), 避免随后的原地 apply 污染快照
+    return {sid: json.loads(json.dumps(snap, ensure_ascii=False, default=str))
+            for sid, snap in out.items()}
 
 
 class BoardManager:
@@ -182,6 +216,9 @@ class BoardManager:
                     state = doc.export_state()      # 循环线程内导出, 避免竞态
                     await asyncio.get_running_loop().run_in_executor(
                         None, hist.save_snapshot, doc, state)
+                # 撤销栈落盘, 卸载后其他设备仍可继续撤销
+                undo_store = undo_service.for_board(board_id)
+                await asyncio.get_running_loop().run_in_executor(None, undo_store.flush)
             except Exception:                                   # noqa: BLE001
                 pass
             unloaded.append(board_id)
@@ -204,6 +241,7 @@ class BoardManager:
         accepted: List[Dict[str, Any]] = []
         async with self.lock_for(board_id):
             doc = await self.get_doc(board_id)
+            undo_store = undo_service.for_board(board_id)
             for raw in raw_ops[:max_batch]:
                 clean = validate_op(raw)
                 if clean is None:
@@ -219,10 +257,20 @@ class BoardManager:
                     dup["dup"] = True
                     accepted.append(dup)
                     continue
+                # 撤销栈捕获: 拍这批操作前受影响图形的浅拷贝(逆操作需要旧值),
+                # 必须在 apply_op 之前; 同时登记 site → 用户归属(跨设备撤销判定)。
+                leaves = clean.get("ops") if clean["type"] == "batch" else [clean]
+                before = _snapshot_before(doc, leaves)
+                for leaf in leaves:
+                    register_site(str(leaf.get("site") or ""), by)
                 rev, _applied = doc.apply_op(clean, by=by)
                 accepted.append(clean)
+                for leaf in leaves:
+                    undo_store.record(doc, leaf, by, before)
             if accepted:
                 hist = history_service.for_board(board_id)
+                # move 不进操作日志(纯增量、量大, 见 ws 广播策略), 但撤销栈
+                # 已在上面的 record 中保存其逆增量, 撤销不依赖日志。
                 stamped = [op for op in accepted if "rev" in op and op.get("type") != "move"]
                 await asyncio.get_running_loop().run_in_executor(
                     None, hist.append_ops, stamped)
@@ -277,6 +325,73 @@ class BoardManager:
         self.pending_snapshot[board_id] = False
         return rev
 
+    # ------------------------------------------------------------ 撤销/重做
+    async def execute_undo_redo(self, board_id: str, username: str,
+                                direction: str, gid: Optional[str] = None
+                                ) -> Optional[Dict[str, Any]]:
+        """在 per-board 锁内执行一步服务端撤销/重做。
+
+        undo 栈产生的逆操作以新时钟包成普通 batch 重新进入 CRDT:
+        应用 → 记日志 → 由 WS 层广播给所有副本(含自己的其他设备)。
+        逆操作不带 ug, 不会再产生新的撤销记录。
+        返回 None 表示对应栈为空; result["ops"] 为空表示被并发保护全部跳过。
+        """
+        async with self.lock_for(board_id):
+            doc = await self.get_doc(board_id)
+            store = undo_service.for_board(board_id)
+            result = store.execute(doc, username, direction, gid)
+            if result is None:
+                return None
+            leaf_ops = result.get("ops") or []
+            stamped: Optional[Dict[str, Any]] = None
+            if leaf_ops:
+                # 叶子已带 (op_id/site/lam/ts) 信封; 包一层 batch 便于单 rev
+                # 原子生效与单条广播。逐叶子再校验一遍(防御, 丢弃任何杂散标记),
+                # 用校验后的副本重写叶子, 保证 batch op_id 与子 op 不重复
+                # (否则子 op_id 会先占满 _seen, 导致 batch 被判为 dup)。
+                subs = []
+                for leaf in leaf_ops:
+                    cs = validate_op(leaf)
+                    if cs is not None:
+                        cs.pop("ug", None)
+                        cs.pop("ulabel", None)
+                        cs["op_id"] = f"{cs['site']}:u{cs['lam']}"
+                        subs.append(cs)
+                if subs:
+                    if len(subs) == 1:
+                        batch_op = subs[0]
+                    else:
+                        max_lam = max(int(s.get("lam") or 0) for s in subs)
+                        any_site = subs[0]["site"]
+                        batch_op = {
+                            "op_id": f"{any_site}:batch{max_lam}",
+                            "site": any_site, "lam": max_lam,
+                            "ts": max(int(s.get("ts") or 0) for s in subs),
+                            "type": "batch", "base_rev": 0, "ops": subs,
+                        }
+                    rev, _applied = doc.apply_op(batch_op, by=username)
+                    batch_op["origin"] = direction      # undo | redo
+                    stamped = batch_op
+                    hist = history_service.for_board(board_id)
+                    # 普通客户端 move 不进日志(高频、可从快照/补发重建); 但
+                    # 撤销/重做产生的 move 是服务端权威的收敛逆增量 —— 必须
+                    # 落盘, 否则离线设备补发与服务器重建会丢掉这步位移。
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, hist.append_ops, [batch_op])
+                    self.pending_snapshot[board_id] = True
+                    meta = self.metas.get(board_id)
+                    if meta is not None:
+                        meta["updated_at"] = now_ms()
+            # 栈已变更 → 立即落盘(撤销必须在刷新/崩溃后仍可继续)
+            await asyncio.get_running_loop().run_in_executor(None, store.flush)
+            self.touch(board_id)
+            result["head_rev"] = doc.head_rev
+            result["op"] = stamped
+            result["history"] = store.history(username)
+            result["undo"] = result["history"].get("undo_depth", 0)
+            result["redo"] = result["history"].get("redo_depth", 0)
+            return result
+
     # ------------------------------------------------------------ 创建/删除
     async def create_board(self, name: str, mode: str, owner: str,
                            template_id: Optional[str] = None,
@@ -328,6 +443,7 @@ class BoardManager:
         self.docs.pop(board_id, None)
         self.metas.pop(board_id, None)
         history_service.drop(board_id)
+        undo_service.drop(board_id)
         await asyncio.get_running_loop().run_in_executor(
             None, shutil.rmtree, config.board_dir(board_id), True)
         await self.save_meta(board_id)   # metas 已删 → 重写索引

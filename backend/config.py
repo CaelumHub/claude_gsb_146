@@ -13,7 +13,10 @@
         state.json               最新状态快照(=最近一次 snapshot)
         ops/YYYYMMDD-HH.jsonl    操作日志, 按小时分片, JSON Lines 追加写
         snapshots/00000123.json  周期性状态快照(以 rev 命名)
+        undo/<user>.json         每用户的服务端撤销/重做栈(刷新/换设备可撤销)
         chat/YYYYMMDD.json       聊天消息, 按天分片
+    data/
+      site_registry.json         CRDT 站点 ID → 用户名归属(跨设备撤销归属判定)
 """
 from __future__ import annotations
 
@@ -50,6 +53,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "allow_register": True,            # 是否允许自助注册
     "max_clients_per_board": 32,
     "compact_archived_shards": True,   # 保留期整理时是否物理压缩归档分片
+    "undo_stack_depth": 100,           # 每用户每白板服务端撤销/重做栈最大步数
 }
 
 # ---------------------------------------------------------------- 进程级常量
@@ -57,7 +61,6 @@ SESSION_TTL_SECS = 7 * 24 * 3600        # 会话令牌有效期
 WS_HEARTBEAT_SECS = 25                  # 服务端 ping 间隔
 WS_TIMEOUT_SECS = 65                    # 超过该时间无任何消息判定断线
 RING_BUFFER_OPS = 2000                  # 每白板内存中缓存的最近操作数(快速补发)
-UNDO_SERVER_DEPTH = 0                   # 撤销完全由客户端逆操作实现, 服务端不存栈
 MOVE_COALESCE_WINDOW_MS = 900           # 回放/压缩时合并连续 move 增量的时间窗
 MAX_CATCHUP_OPS = 5000                  # 单次断线补发的最大操作数, 超过则改发全量快照
 

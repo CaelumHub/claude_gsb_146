@@ -3,15 +3,18 @@
 协议(客户端 → 服务端):
     hello      {client_id, last_rev, page}        连接后首条(参数也可走 query)
     op / ops   {op} | {ops:[...]}                 提交 CRDT 操作(editor+)
+    undo/redo  {gid?}                             请求服务端撤销/重做一步
     chat       {text}                             聊天(commenter+)
     presence   {cursor:{x,y}, tool, selection}    光标/工具状态(节流广播)
     ping       {}                                 心跳应答
     leave      {}                                 主动离开
 
 协议(服务端 → 客户端):
-    welcome    {you, board, role, head_rev, clients, state?|catchup?}
+    welcome    {you, board, role, head_rev, clients, state?|catchup?, undo?}
     ack        {acks:[{op_id, rev, dup?}], head_rev}
     ops        {ops:[...带 rev/by], head_rev, by}  他人的操作广播
+    undo_result {direction, ok, applied, reason?, head_rev, undo, redo, gid, label}
+    undo_push  {user, undo, redo}                  该用户栈深度变更(多标签同步)
     presence   {clients:{cid: {...}}}             在线状态全量
     cursor     {client_id, user, cursor, tool, selection}
     join/leave {client_id, user}
@@ -45,6 +48,7 @@ from . import auth, chat as chat_mod, config
 from .boards import manager
 from .history import history_service
 from .models import limit_catchup
+from .undo import undo_service
 
 router = APIRouter()
 
@@ -168,6 +172,20 @@ class ConnectionManager:
         if not client.offer(message):
             await self.disconnect(client, reason="send-overflow")
 
+    async def broadcast_user(self, board_id: str, username: str, message: dict,
+                             exclude_client: Optional[str] = None) -> None:
+        """只投递给同一用户名的连接(撤销栈深度跨标签/跨设备同步)。"""
+        room = self.rooms.get(board_id)
+        if room is None:
+            return
+        for client in list(room.clients.values()):
+            if client.user.get("username") != username:
+                continue
+            if exclude_client and client.key == exclude_client:
+                continue
+            if not client.offer(message):
+                asyncio.ensure_future(self.disconnect(client, reason="send-overflow"))
+
     def room_snapshot_clients(self, room: Room) -> Dict[str, Any]:
         return {c.key: c.presence_dict() for c in room.clients.values()}
 
@@ -276,6 +294,15 @@ class ConnectionManager:
             else:
                 welcome["catchup"] = {"from_rev": client.last_rev,
                                       "ops": ops, "source": source}
+        # 服务端撤销栈: 刷新/换设备后按钮深度与标签从这里恢复
+        try:
+            _store = undo_service.for_board(board_id)
+            _uname = client.user.get("username", "")
+            welcome["undo"] = await asyncio.get_running_loop().run_in_executor(
+                None, _store.history, _uname)
+        except Exception:                                   # noqa: BLE001
+            welcome["undo"] = {"undo_depth": 0, "redo_depth": 0,
+                               "labels": [], "last_label": ""}
         await self.send(client, welcome)
         client.last_rev = head_rev
 
@@ -321,6 +348,8 @@ class ConnectionManager:
             mtype = msg.get("type")
             if mtype in ("op", "ops"):
                 await self._handle_ops(client, room, msg)
+            elif mtype in ("undo", "redo"):
+                await self._handle_undo(client, room, msg, mtype)
             elif mtype == "chat":
                 await self._handle_chat(client, msg)
             elif mtype == "presence":
@@ -369,6 +398,57 @@ class ConnectionManager:
         if snap_rev:
             await self.broadcast(client.board_id,
                                  {"type": "snapshot_saved", "rev": snap_rev})
+
+    # ------------------------------------------------------------ 撤销/重做
+    async def _handle_undo(self, client: Client, room: Room,
+                           msg: Dict[str, Any], direction: str) -> None:
+        if not auth.role_at_least(client.role, "commenter"):
+            await self.send(client, {"type": "error", "code": "read_only",
+                                     "message": "当前角色无法编辑(需要 editor 及以上)"})
+            return
+        gid = msg.get("gid")
+        gid = str(gid)[:80] if gid else None
+        req_id = str(msg.get("req_id") or "")[:80]
+        username = client.user.get("username", "")
+        result = await manager.execute_undo_redo(
+            client.board_id, username, direction, gid)
+        if result is None:
+            await self.send(client, {"type": "undo_result", "direction": direction,
+                                     "ok": False, "applied": 0, "reason": "empty",
+                                     "gid": gid, "req_id": req_id,
+                                     "undo": 0, "redo": 0})
+            return
+        head_rev = result["head_rev"]
+        op = result.get("op")
+        history = result.get("history") or {}
+        if op is not None:
+            room.remember([op])
+            # 逆操作作为普通 ops 广播给房间内所有人(含发起者), 所有副本统一收敛。
+            # 发起者不做乐观本地应用, 以这条广播为准(避免与服务端时钟不一致)。
+            await self.broadcast(client.board_id, {
+                "type": "ops", "ops": [op], "head_rev": head_rev,
+                "by": username, "client_id": client.client_id,
+            })
+            for c in room.clients.values():
+                c.last_rev = max(c.last_rev, head_rev)
+        else:
+            client.last_rev = max(client.last_rev, head_rev)
+        await self.send(client, {
+            "type": "undo_result", "direction": direction,
+            "ok": True, "applied": result.get("applied", 0),
+            "reason": result.get("reason"),
+            "gid": result.get("gid"), "label": result.get("label", ""),
+            "head_rev": head_rev, "req_id": req_id,
+            "undo": history.get("undo_depth", 0),
+            "redo": history.get("redo_depth", 0),
+        })
+        # 把栈深度推给同一用户的其他连接(多标签/多设备按钮状态同步)
+        await self.broadcast_user(client.board_id, username, {
+            "type": "undo_push", "user": username,
+            "undo": history.get("undo_depth", 0),
+            "redo": history.get("redo_depth", 0),
+            "last_label": history.get("last_label", ""),
+        }, exclude_client=client.key)
 
     # ------------------------------------------------------------ 聊天
     async def _handle_chat(self, client: Client, msg: Dict[str, Any]) -> None:
@@ -426,12 +506,16 @@ class ConnectionManager:
                         await self.send(client, {"type": "ping",
                                                  "ts": int(now * 1000)})
             if tick % 30 == 0:
-                # 周期快照 + 内存卸载巡检
+                # 周期快照 + 内存卸载巡检 + 撤销栈/站点归属落盘
                 for board_id in list(self.pending_boards()):
                     try:
                         await manager.maybe_snapshot(board_id)
                     except Exception:                                # noqa: BLE001
                         pass
+                try:
+                    undo_service.flush_all()
+                except Exception:                                    # noqa: BLE001
+                    pass
             if tick % 300 == 0:
                 try:
                     await manager.unload_idle()
