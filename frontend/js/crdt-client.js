@@ -214,18 +214,33 @@ export function loadShapes(shapesArray) {
 }
 
 /* ================================================================
-   CrdtClient —— 操作工厂(lamport 时钟) + 撤销/重做栈
+   CrdtClient —— 操作工厂(lamport 时钟) + 服务端撤销/重做
+
+   撤销栈的「真源」在服务端(按 白板 × 用户 持久化):
+   - commit / 手势结束 → 发送 undo_checkpoint 登记一个撤销单元;
+   - undo()/redo() → 发送 undo/redo 请求, 服务端签发逆操作后广播,
+     本地状态以服务端操作为准(刷新、重连、换设备后语义一致);
+   - 服务端通过 welcome.undo_state 与 undo_state 消息推送栈摘要,
+     本类只镜像 {gid,label} 列表用于按钮可用性。
    ================================================================ */
 export class CrdtClient {
-  /** @param {string} siteId 站点 ID(与 WS clientId 一致) */
-  constructor(siteId) {
+  /**
+   * @param {string} siteId 站点 ID(与 WS clientId 一致)
+   * @param {object} [opts]
+   *   onOps: (ops[]) => void  由页面注入(发送到 WS)
+   *   onControl: (msg) => void  撤销/重做/checkpoint 控制消息
+   */
+  constructor(siteId, opts = {}) {
     this.site = siteId;
     this.lam = 0;
     this.seq = 0;
-    this.undoStack = [];        // [{ops, inverse, label}]
+    this.undoStack = [];        // 服务端镜像: [{gid,label}]
     this.redoStack = [];
     this.maxDepth = 100;
-    this.onOps = null;          // (ops[]) => void  由页面注入(发送到 WS)
+    this.onOps = opts.onOps || null;          // (ops[]) => void  由页面注入
+    this.onControl = opts.onControl || null;  // (msg) => void
+    this.getBaseRev = opts.getBaseRev || (() => 0);  // 当前已知服务端 head rev
+    this._seenIds = new Set();   // 已应用 op_id 去重(move 重放保护)
   }
 
   /** 观察到远端操作时推进 lamport 时钟 */
@@ -235,10 +250,35 @@ export class CrdtClient {
     if (op?.type === 'batch') (op.ops || []).forEach((sub) => this.witness(sub));
   }
 
+  /** 合并服务端/远端操作, 按 op_id 幂等去重, 返回受影响图形集合 */
+  receiveOps(shapes, ops) {
+    for (const op of ops || []) this.witness(op);
+    const deduped = [];
+    for (const op of ops || []) {
+      if (op?.op_id) {
+        if (this._seenIds.has(op.op_id)) continue;
+        this._seenIds.add(op.op_id);
+        if (this._seenIds.size > 8192) {
+          this._seenIds = new Set([...this._seenIds].slice(-4096));
+        }
+      }
+      deduped.push(op);
+    }
+    return mergeOps(shapes, deduped);
+  }
+
   _next() {
     this.lam += 1;
     this.seq += 1;
     return { site: this.site, lam: this.lam, op_id: `${this.site}:${this.seq}` };
+  }
+
+  /** 控制消息用的唯一编号(与编辑 op 的 seq 独立计数) */
+  _ctlId(prefix) {
+    this.seq += 1;
+    const rand = (crypto?.randomUUID ? crypto.randomUUID().replace(/-/g, '')
+      : Math.random().toString(36).slice(2) + Date.now().toString(36)).slice(0, 24);
+    return `${prefix}_${this.site}:${this.seq}:${rand}`;
   }
 
   _envelope(type, payload, baseRev = 0) {
@@ -298,9 +338,8 @@ export class CrdtClient {
 
   /* ------------------------------------------------------------ 提交与撤销 */
   /**
-   * 提交一组本地操作: 乐观应用到 shapes, 记录撤销信息, 发送出去。
-   * 撤销栈保存的是「语义操作」(不带信封); 撤销/重做执行时用 reissue
-   * 重新签发新 op_id/lamport —— 旧 op_id 会被服务端幂等去重, 必须换新。
+   * 提交一组本地操作: 乐观应用到 shapes, 发送出去, 并把撤销单元登记
+   * 到服务端撤销栈(逆操作叶子 = invertOps, 重做叶子 = 原语义操作)。
    * @param {Map} shapes
    * @param {object[]} ops 叶子操作数组(commit 内部负责包 batch)
    */
@@ -309,21 +348,52 @@ export class CrdtClient {
     if (!list.length) return null;
     const captured = snapshotAffected(shapes, list);
     mergeOps(shapes, list);
+    list.forEach((op) => op.op_id && this._seenIds.add(op.op_id));
     const inverse = invertOps(list, captured);           // 语义逆操作
     const recipe = list.map(cloneOp);                    // 语义原操作(重做用)
-    this.undoStack.push({ undoOps: inverse, redoOps: recipe, label });
+    const gid = this._ctlId('g');
+    const entry = { gid, label };
+    this.undoStack.push(entry);
     if (this.undoStack.length > this.maxDepth) this.undoStack.shift();
     this.redoStack.length = 0;
     this._emit(list);
+    // 撤销冲突扫描窗口的下界 = 提交时刻的服务端 head rev。
+    // 注意: 此刻该 head 尚未包含 list 本身, 服务端把 list 之后的操作
+    // 视为「后续操作」, 自己刚发的这些叶子就是原动作, 不会误判为冲突。
+    this._checkpoint(gid, label, inverse, recipe, this.getBaseRev());
     return list;
   }
 
-  /** 只发送不记撤销(如实时拖动的中间增量帧) */
+  /** 只发送不记撤销(如实时拖动/缩放/手绘的中间增量帧) */
   send(shapes, ops) {
     const list = (Array.isArray(ops) ? ops : [ops]).filter(Boolean);
     if (!list.length) return;
     mergeOps(shapes, list);
+    list.forEach((op) => op.op_id && this._seenIds.add(op.op_id));
     this._emit(list);
+  }
+
+  /**
+   * 为「流式发送、手势结束才成一个撤销单元」的交互(拖动/缩放/手绘/擦除)
+   * 登记撤销单元。undoLeaves/redoLeaves 为无信封语义叶子。
+   */
+  registerUndo(label, undoLeaves, redoLeaves, baseRev = 0) {
+    const gid = this._ctlId('g');
+    this.undoStack.push({ gid, label });
+    if (this.undoStack.length > this.maxDepth) this.undoStack.shift();
+    this.redoStack.length = 0;
+    this._checkpoint(gid, label, undoLeaves, redoLeaves, baseRev);
+    return gid;
+  }
+
+  _checkpoint(gid, label, undoLeaves, redoLeaves, baseRev = 0) {
+    if (!this.onControl) return;
+    this.onControl({
+      type: 'undo_checkpoint', gid, label,
+      undo: (undoLeaves || []).map(stripEnvelope),
+      redo: (redoLeaves || []).map(stripEnvelope),
+      base_rev: baseRev || 0,
+    });
   }
 
   _emit(list) {
@@ -335,27 +405,32 @@ export class CrdtClient {
   canUndo() { return this.undoStack.length > 0; }
   canRedo() { return this.redoStack.length > 0; }
 
-  /** 撤销: 发布语义逆操作(新时钟新 op_id), 他人并发编辑不受影响 */
-  undo(shapes) {
-    const entry = this.undoStack.pop();
-    if (!entry) return null;
-    const fresh = reissue(entry.undoOps, this);
-    mergeOps(shapes, fresh);
-    this.redoStack.push({ redoOps: entry.redoOps, undoOps: entry.undoOps, label: entry.label });
-    if (this.redoStack.length > this.maxDepth) this.redoStack.shift();
-    this._emit(fresh);
+  /** 撤销: 请服务端签发语义逆操作(结果以 undo_state / ops 广播为准) */
+  undo() {
+    if (!this.canUndo()) return null;
+    const entry = this.undoStack[this.undoStack.length - 1];
+    if (this.onControl) {
+      this.onControl({ type: 'undo', req_id: this._ctlId('u') });
+    }
     return entry;
   }
 
-  /** 重做: 用新时钟重新发布原变更 */
-  redo(shapes) {
-    const entry = this.redoStack.pop();
-    if (!entry) return null;
-    const fresh = reissue(entry.redoOps, this);
-    mergeOps(shapes, fresh);
-    this.undoStack.push({ undoOps: entry.undoOps, redoOps: entry.redoOps, label: entry.label });
-    this._emit(fresh);
+  /** 重做: 请服务端用新时钟重新发布原变更 */
+  redo() {
+    if (!this.canRedo()) return null;
+    const entry = this.redoStack[this.redoStack.length - 1];
+    if (this.onControl) {
+      this.onControl({ type: 'redo', req_id: this._ctlId('r') });
+    }
     return entry;
+  }
+
+  /** 安装服务端推送的栈摘要(welcome / undo_state / 跨设备同步) */
+  installUndoState(state) {
+    const norm = (arr) => (Array.isArray(arr) ? arr
+      .filter((e) => e && e.gid).map((e) => ({ gid: String(e.gid), label: e.label || '' })) : []);
+    this.undoStack = norm(state?.undo);
+    this.redoStack = norm(state?.redo);
   }
 
   clearHistory() {
@@ -364,18 +439,18 @@ export class CrdtClient {
   }
 }
 
-function cloneOp(op) { return JSON.parse(JSON.stringify(op)); }
-
-/** 用当前时钟重新签发一批操作(新 op_id/lam/ts, 语义不变) */
-function reissue(ops, client) {
-  return (ops || []).map((op) => {
-    if (op.type === 'batch') {
-      return { ...client._next(), type: 'batch', ts: Date.now(), ops: reissue(op.ops, client) };
-    }
-    const { op_id, lam, ts, rev, by, dup, base_rev, ...payload } = op;
-    return { ...client._next(), ts: Date.now(), base_rev: 0, ...payload };
-  });
+/** 剥掉操作信封, 只留语义负载(服务端 checkpoint 存储要求) */
+function stripEnvelope(op) {
+  if (!op || typeof op !== 'object') return op;
+  if (op.type === 'batch') return { ...op, ops: (op.ops || []).map(stripEnvelope) };
+  const out = {};
+  for (const [k, v] of Object.entries(op)) {
+    if (!['op_id', 'site', 'lam', 'ts', 'base_rev', 'rev', 'by', 'dup'].includes(k)) out[k] = v;
+  }
+  return out;
 }
+
+function cloneOp(op) { return JSON.parse(JSON.stringify(op)); }
 
 /** 收集操作涉及的图形当前浅拷贝(生成逆操作用) */
 export function snapshotAffected(shapes, ops) {

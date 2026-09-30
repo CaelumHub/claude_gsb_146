@@ -45,7 +45,11 @@ class BoardHistory:
         if not ops:
             return None
         ts = ops[0].get("ts")
-        return self.log.append(ops, ts_ms=ts)
+        name = self.log.append(ops, ts_ms=ts)
+        # 分片内容变了, 失效其 (last_rev/count …) 元信息缓存,
+        # 否则紧接其后的重建/replay 会按旧 last_rev 漏掉刚写入的操作。
+        SHARD_META_CACHE.pop(shard_cache_key(self.log.shard_path(name)), None)
+        return name
 
     def flush(self) -> None:
         name = self.log.shard_name()
@@ -82,8 +86,13 @@ class BoardHistory:
 
     # ---------------------------------------------------------------- 读取
     def iter_ops(self, from_rev: int = 0, to_rev: Optional[int] = None,
-                 limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        """按 rev 升序返回 (from_rev, to_rev] 区间的操作(线性扫相关分片)。"""
+                 limit: Optional[int] = None,
+                 include_moves: bool = True) -> List[Dict[str, Any]]:
+        """按 rev 升序返回 (from_rev, to_rev] 区间的操作(线性扫相关分片)。
+
+        include_moves=False 供撤销冲突扫描: move 增量可交换, 不构成
+        LWW 字段冲突, 跳过它们也避免高频拖动把扫描额度吃满。
+        """
         out: List[Dict[str, Any]] = []
         for meta in self.shards_index():
             last = meta.get("last_rev")
@@ -94,7 +103,9 @@ class BoardHistory:
                 break
             for rec in self.log.read_shard(meta["name"]):
                 rev = rec.get("rev") or 0
-                if rev > from_rev and (to_rev is None or rev <= to_rev) and rec.get("type") != "move":
+                if rev > from_rev and (to_rev is None or rev <= to_rev):
+                    if not include_moves and rec.get("type") == "move":
+                        continue
                     out.append(rec)
                     if limit and len(out) >= limit:
                         return out
@@ -195,7 +206,8 @@ class BoardHistory:
         """
         snapshot = self.load_snapshot(at_rev)
         base_rev = int((snapshot or {}).get("rev") or 0)
-        ops = self.iter_ops(from_rev=base_rev + 1, to_rev=at_rev, limit=page_limit)
+        # iter_ops 区间为 (from_rev, to_rev], 故下界传快照 rev 本身
+        ops = self.iter_ops(from_rev=base_rev, to_rev=at_rev, limit=page_limit)
         if coalesce:
             from .crdt import coalesce_moves
             ops = coalesce_moves(ops, config.MOVE_COALESCE_WINDOW_MS)

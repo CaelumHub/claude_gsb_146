@@ -469,11 +469,11 @@ export class ToolManager {
           if (Math.abs(dx) > 0.01 || Math.abs(dy) > 0.01) {
             this._sendRaw(drag.ids.map((id) => this.crdt.move(id, dx, dy)));
           }
-          // 撤销栈: 一步撤销整个拖动(逆操作 = 每个图形的反向累计位移)
+          // 撤销单元登记到服务端: 一步撤销整个拖动
+          // (逆操作 = 每个图形的反向累计位移; 重做 = 原累计位移)
           const undoOps = drag.ids.map((id) => ({ type: 'move', id, dx: -drag.accum.dx, dy: -drag.accum.dy }));
           const redoOps = drag.ids.map((id) => ({ type: 'move', id, dx: drag.accum.dx, dy: drag.accum.dy }));
-          this.crdt.undoStack.push({ undoOps, redoOps, label: '移动' });
-          this.crdt.redoStack.length = 0;
+          this.crdt.registerUndo('移动', undoOps, redoOps, this.socket?.lastRev || 0);
           this.engine.markDirty('overlay');
         }
         break;
@@ -486,8 +486,7 @@ export class ToolManager {
           const inverse = { type: 'set_props', id: drag.id, props: { x: b.x, y: b.y, w: b.w, h: b.h } };
           // 单次签发: 本地合并与网络发送使用同一个操作对象, 保证字段时钟一致
           this.crdt.send(this.shapes, [this.crdt.setProps(drag.id, props)]);
-          this.crdt.undoStack.push({ undoOps: [inverse], redoOps: [semantic], label: '缩放' });
-          this.crdt.redoStack.length = 0;
+          this.crdt.registerUndo('缩放', [inverse], [semantic], this.socket?.lastRev || 0);
         }
         this.engine.markDirty('overlay');
         break;
@@ -501,8 +500,7 @@ export class ToolManager {
           const fullShape = stripPrivate(shape);
           const undoOps = [{ type: 'delete_shape', id: shape.id }];
           const redoOps = [{ type: 'add_shape', shape: fullShape }];
-          this.crdt.undoStack.push({ undoOps, redoOps, label: '手绘' });
-          this.crdt.redoStack.length = 0;
+          this.crdt.registerUndo('手绘', undoOps, redoOps, this.socket?.lastRev || 0);
           this.engine.selection = new Set([shape.id]);
           this._notifySelection();
         }
@@ -557,12 +555,10 @@ export class ToolManager {
         if (drag.erased.length) {
           const ids = [...drag.erased];
           this._sendRaw(ids.map((id) => this.crdt.deleteShape(id)));
-          this.crdt.undoStack.push({
-            undoOps: ids.map((id) => ({ type: 'restore_shape', id })),
-            redoOps: ids.map((id) => ({ type: 'delete_shape', id })),
-            label: '擦除',
-          });
-          this.crdt.redoStack.length = 0;
+          this.crdt.registerUndo('擦除',
+            ids.map((id) => ({ type: 'restore_shape', id })),
+            ids.map((id) => ({ type: 'delete_shape', id })),
+            this.socket?.lastRev || 0);
           for (const id of ids) this.engine.selection.delete(id);
           this.engine.markDirty();
         }
@@ -658,23 +654,14 @@ export class ToolManager {
   /* ------------------------------------------------------------ 编辑动作 */
   undo() {
     if (this.readOnly) return;
-    const entry = this.crdt.undo(this.shapes);
-    if (entry) {
-      for (const id of this.engine.selection) if (!this.shapes.get(id) || this.shapes.get(id).deleted) this.engine.selection.delete(id);
-      this.engine.rebuildIndex();
-      this.engine.markDirty();
-      if (this.opts.onHistoryChange) this.opts.onHistoryChange();
-    }
+    // 服务端撤销: 逆操作由服务端签发并经 ops 广播回到本地,
+    // 这里只发请求; 栈摘要由 undo_state 消息驱动 onHistoryChange。
+    this.crdt.undo();
   }
 
   redo() {
     if (this.readOnly) return;
-    const entry = this.crdt.redo(this.shapes);
-    if (entry) {
-      this.engine.rebuildIndex();
-      this.engine.markDirty();
-      if (this.opts.onHistoryChange) this.opts.onHistoryChange();
-    }
+    this.crdt.redo();
   }
 
   deleteSelection() {

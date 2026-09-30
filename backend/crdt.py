@@ -26,7 +26,10 @@
 * **批量与撤销**
   batch 把多个子操作打包为一个 rev / 一个撤销单元。撤销不是回滚,
   而是发布语义逆操作(move→反向move, add→delete, set_props→写回
-  旧值), 因此与他人的并发操作天然可合并; redo 用新时钟重放原变更。
+  旧值), 因此与他人的并发操作天然可合并。撤销栈由 undo.py 在服务端
+  按「白板 × 用户」持久化, 逆操作也由服务端以新 op_id/时钟签发,
+  刷新、重连或换设备后仍可撤销, 且签发前会跳过已被他人并发修改的
+  字段; redo 用新时钟重放原变更。
 
 操作信封:
     {op_id, site, lam, ts, type, base_rev, ...payload}
@@ -277,8 +280,8 @@ def validate_op(op: Any) -> Optional[Dict[str, Any]]:
         dy = _finite_number(op.get("dy"))
         if not target or dx is None or dy is None:
             return None
-        if dx == 0 or dy == 0:
-            return None                            # 空移动直接丢弃
+        if dx == 0 and dy == 0:
+            return None                            # 纯空移动才丢弃; 单轴(横向/纵向)合法
         clean.update({"id": target, "dx": dx, "dy": dy})
     elif op_type == "set_props":
         target = str(op.get("id") or "")[:64]
@@ -432,9 +435,10 @@ class BoardDoc:
             shape = self._placeholder(target_id)
 
         if kind == "move":
-            # 增量对已删除图形同样累计(复活后位置正确, 且满足交换律)
-            shape["x"] = round(float(shape.get("x") or 0) + float(op["dy"]), 6)
-            shape["y"] = round(float(shape.get("y") or 0) + float(op["dx"]), 6)
+            # 增量对已删除图形同样累计(复活后位置正确, 且满足交换律)。
+            # x 轴累计 dx、y 轴累计 dy —— 与客户端 mergeOp 的 move 语义一致。
+            shape["x"] = round(float(shape.get("x") or 0) + float(op["dx"]), 6)
+            shape["y"] = round(float(shape.get("y") or 0) + float(op["dy"]), 6)
             return True
 
         if kind == "path_extend":

@@ -135,7 +135,7 @@
 <script type="module">
 import { Api } from './js/api.js';
 import { BoardSocket } from './js/ws.js';
-import { CrdtClient, mergeOps } from './js/crdt-client.js';
+import { CrdtClient } from './js/crdt-client.js';
 import { BoardEngine } from './js/engine.js';
 import { ToolManager } from './js/tools.js';
 import { MindmapController } from './js/mindmap.js';
@@ -171,9 +171,12 @@ const engine = new BoardEngine(host, { page: 'mindmap', background: '#fbfbf9', g
 const shapes = new Map();
 engine.setShapesMap(shapes);
 
-const crdt = new CrdtClient(`m${(Math.random() * 1e6 | 0).toString(36)}${Date.now().toString(36)}`);
+const crdt = new CrdtClient(`m${(Math.random() * 1e6 | 0).toString(36)}${Date.now().toString(36)}`, {
+  getBaseRev: () => socket.lastRev,
+});
 const socket = new BoardSocket(boardId, { page: 'mindmap' });
 crdt.onOps = (ops) => { socket.sendOps(ops); updateStatus(); };
+crdt.onControl = (msg) => socket.sendControl(msg);
 
 const tools = new ToolManager({
   engine, crdt, socket, shapes,
@@ -312,11 +315,11 @@ socket.on('welcome', (msg) => {
     engine.rebuildIndex();
     syncZCounter(shapes);
   } else if (msg.catchup?.ops?.length) {
-    for (const op of msg.catchup.ops) crdt.witness(op);
-    const touched = mergeOps(shapes, msg.catchup.ops);
+    const touched = crdt.receiveOps(shapes, msg.catchup.ops);
     engine.onShapesChanged(touched);
     toast(`已补发 ${msg.catchup.ops.length} 个离线期间的操作`, 'success');
   }
+  crdt.installUndoState(msg.undo_state);
   renderUsers(msg.clients);
   tools.readOnly = myRole === 'viewer' || myRole === 'commenter';
   if (tools.readOnly) {
@@ -331,13 +334,18 @@ socket.on('welcome', (msg) => {
 });
 
 socket.on('ops', (msg) => {
-  for (const op of msg.ops || []) crdt.witness(op);
-  const touched = mergeOps(shapes, msg.ops || []);
+  const touched = crdt.receiveOps(shapes, msg.ops || []);
   engine.onShapesChanged(touched);
   if (structuralOps(msg.ops)) controller.onRemoteStructuralChange();
   else controller.renderOutline();
+  updateHistoryButtons();
   updateStatus();
   setTimeout(updateMinimap, 200);
+});
+
+socket.on('undo_state', (msg) => {
+  crdt.installUndoState(msg.state);
+  updateHistoryButtons();
 });
 
 socket.on('ack', () => updateStatus());

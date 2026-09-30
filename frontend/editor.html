@@ -187,7 +187,7 @@
 <script type="module">
 import { Api } from './js/api.js';
 import { BoardSocket } from './js/ws.js';
-import { CrdtClient, mergeOps, loadShapes } from './js/crdt-client.js';
+import { CrdtClient } from './js/crdt-client.js';
 import { BoardEngine } from './js/engine.js';
 import { ToolManager } from './js/tools.js';
 import { KIND_LABEL, NOTE_PALETTE, STROKE_PALETTE, syncZCounter } from './js/shapes.js';
@@ -252,9 +252,12 @@ const engine = new BoardEngine(host, {
 const shapes = new Map();
 engine.setShapesMap(shapes);
 
-const crdt = new CrdtClient(`c${(Math.random() * 1e6 | 0).toString(36)}${Date.now().toString(36)}`);
+const crdt = new CrdtClient(`c${(Math.random() * 1e6 | 0).toString(36)}${Date.now().toString(36)}`, {
+  getBaseRev: () => socket.lastRev,
+});
 const socket = new BoardSocket(boardId, { page: 'editor' });
 crdt.onOps = (ops) => socket.sendOps(ops);
+crdt.onControl = (msg) => socket.sendControl(msg);
 
 const tools = new ToolManager({
   engine, crdt, socket, shapes,
@@ -542,12 +545,14 @@ socket.on('welcome', async (msg) => {
     engine.rebuildIndex();
     syncZCounter(shapes);
   } else if (msg.catchup?.ops?.length) {
-    for (const op of msg.catchup.ops) crdt.witness(op);
-    const touched = mergeOps(shapes, msg.catchup.ops);
+    const touched = crdt.receiveOps(shapes, msg.catchup.ops);
     invalidateFromOps(msg.catchup.ops);
     engine.onShapesChanged(touched);
     toast(`已补发 ${msg.catchup.ops.length} 个离线期间的操作`, 'success');
   }
+  // 服务端撤销栈(刷新/换设备后恢复「撤销自己最近操作」的能力)
+  crdt.installUndoState(msg.undo_state);
+  updateHistoryButtons();
   renderUsers(msg.clients);
   tools.readOnly = myRole === 'viewer' || myRole === 'commenter';
   if (tools.readOnly) {
@@ -560,12 +565,22 @@ socket.on('welcome', async (msg) => {
 });
 
 socket.on('ops', (msg) => {
-  for (const op of msg.ops || []) crdt.witness(op);
-  const touched = mergeOps(shapes, msg.ops || []);
+  const touched = crdt.receiveOps(shapes, msg.ops || []);
   invalidateFromOps(msg.ops || []);
   engine.onShapesChanged(touched);
+  // 撤销/重做广播可能让选中图形消失(删除/恢复)
+  for (const id of [...engine.selection]) {
+    const s = shapes.get(id);
+    if (!s || s.deleted || s.kind === 'ghost') engine.selection.delete(id);
+  }
   updateStats();
+  renderSelectionPanel();
   scheduleThumbnail();
+});
+
+socket.on('undo_state', (msg) => {
+  crdt.installUndoState(msg.state);
+  updateHistoryButtons();
 });
 
 socket.on('ack', () => updateStats());
@@ -614,11 +629,6 @@ socket.on('fatal', async (msg) => {
     toast('你没有该白板的访问权限', 'error', 6000);
   }
 });
-
-crdt.onOps = (ops) => {
-  socket.sendOps(ops);
-  updateStats();
-};
 
 /* ---------------------------------------------------------------- 初始加载 */
 try {

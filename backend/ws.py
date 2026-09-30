@@ -3,15 +3,19 @@
 协议(客户端 → 服务端):
     hello      {client_id, last_rev, page}        连接后首条(参数也可走 query)
     op / ops   {op} | {ops:[...]}                 提交 CRDT 操作(editor+)
+    undo_checkpoint {gid,label,undo,redo,base_rev}  登记一个撤销单元(服务端栈)
+    undo/redo  {req_id}                           服务端签发语义逆操作
     chat       {text}                             聊天(commenter+)
     presence   {cursor:{x,y}, tool, selection}    光标/工具状态(节流广播)
     ping       {}                                 心跳应答
     leave      {}                                 主动离开
 
 协议(服务端 → 客户端):
-    welcome    {you, board, role, head_rev, clients, state?|catchup?}
+    welcome    {you, board, role, head_rev, clients, undo_state, state?|catchup?}
     ack        {acks:[{op_id, rev, dup?}], head_rev}
-    ops        {ops:[...带 rev/by], head_rev, by}  他人的操作广播
+    ops        {ops:[...带 rev/by], head_rev, by}  他人(或服务端撤销)的操作广播
+    ctrl_ack   {kind:checkpoint|undo|redo, gid?|req_id?, ok?|rev?|noop?|dup?}
+    undo_state {state:{undo:[{gid,label}],redo:[...]}}  该用户撤销栈摘要
     presence   {clients:{cid: {...}}}             在线状态全量
     cursor     {client_id, user, cursor, tool, selection}
     join/leave {client_id, user}
@@ -244,6 +248,8 @@ class ConnectionManager:
         head_rev = doc.head_rev
 
         # -------- 断线补发判定: ring → 磁盘 → 全量快照 ---------
+        # 撤销/重做栈按「白板 × 用户」服务端持久化, 刷新/换设备后同样恢复
+        username = client.user.get("username") or ""
         welcome: Dict[str, Any] = {
             "type": "welcome",
             "you": client.presence_dict(),
@@ -252,6 +258,7 @@ class ConnectionManager:
             "head_rev": head_rev,
             "clients": self.room_snapshot_clients(room),
             "server_time": int(time.time() * 1000),
+            "undo_state": manager.undo_state(board_id, username),
         }
         gap = head_rev - client.last_rev
         if client.last_rev == 0 or limit_catchup(gap, config.RING_BUFFER_OPS,
@@ -321,6 +328,10 @@ class ConnectionManager:
             mtype = msg.get("type")
             if mtype in ("op", "ops"):
                 await self._handle_ops(client, room, msg)
+            elif mtype == "undo_checkpoint":
+                await self._handle_undo_checkpoint(client, msg)
+            elif mtype in ("undo", "redo"):
+                await self._handle_undo_redo(client, room, msg)
             elif mtype == "chat":
                 await self._handle_chat(client, msg)
             elif mtype == "presence":
@@ -356,7 +367,9 @@ class ConnectionManager:
         acks = [{"op_id": op["op_id"], "rev": op.get("rev"),
                  **({"dup": True} if op.get("dup") else {})} for op in accepted]
         await self.send(client, {"type": "ack", "acks": acks, "head_rev": head_rev})
-        fresh = [op for op in accepted if not op.get("dup") and op.get("type") != "move"]
+        # 所有新操作(含 move 增量)都广播: 协作者要看到实时拖动,
+        # 否则撤销移动的逆 move 也无法同步到他人的副本。
+        fresh = [op for op in accepted if not op.get("dup")]
         if fresh:
             room.remember(fresh)
             await self.broadcast(client.board_id, {
@@ -369,6 +382,100 @@ class ConnectionManager:
         if snap_rev:
             await self.broadcast(client.board_id,
                                  {"type": "snapshot_saved", "rev": snap_rev})
+
+    # ------------------------------------------------------------ 服务端撤销
+    async def _handle_undo_checkpoint(self, client: Client, msg: Dict[str, Any]) -> None:
+        """客户端把一个撤销单元(提交/手势结束)登记到服务端撤销栈。"""
+        if not auth.role_at_least(client.role, "commenter"):
+            await self.send(client, {"type": "error", "code": "read_only",
+                                     "message": "当前角色无法编辑"})
+            return
+        gid = str(msg.get("gid") or "")[:64]
+        label = str(msg.get("label") or "")[:40]
+        if not gid or len(gid) > 64:
+            return
+        undo_leaves = msg.get("undo")
+        redo_leaves = msg.get("redo")
+        if not isinstance(undo_leaves, list) or not isinstance(redo_leaves, list) \
+                or not undo_leaves or len(undo_leaves) > 512 \
+                or len(redo_leaves) > 512:
+            return
+        username = client.user.get("username", "")
+        try:
+            base_rev = int(msg.get("base_rev") or client.last_rev or 0)
+        except (TypeError, ValueError):
+            base_rev = client.last_rev
+        try:
+            state = await manager.undo_checkpoint(
+                client.board_id, username, gid, label,
+                undo_leaves, redo_leaves, base_rev)
+        except Exception:                                        # noqa: BLE001
+            await self.send(client, {"type": "error", "code": "undo_failed",
+                                     "message": "撤销单元登记失败"})
+            return
+        await self.send(client, {"type": "ctrl_ack", "kind": "checkpoint",
+                                 "gid": gid, "ok": True})
+        await self._send_undo_state(client, state)
+
+    async def _handle_undo_redo(self, client: Client, room: Room,
+                                msg: Dict[str, Any]) -> None:
+        """服务端执行撤销/重做: 签发逆操作 → 广播 → 推送新栈摘要。"""
+        if not auth.role_at_least(client.role, "commenter"):
+            await self.send(client, {"type": "error", "code": "read_only",
+                                     "message": "当前角色无法编辑"})
+            return
+        direction = str(msg.get("type") or "")
+        req_id = str(msg.get("req_id") or "")[:96]
+        if not req_id:
+            return
+        username = client.user.get("username", "")
+        result = await manager.undo_or_redo(client.board_id, username,
+                                            direction, req_id)
+        if result is None:
+            await self.send(client, {"type": "ctrl_ack", "kind": direction,
+                                     "req_id": req_id, "noop": True,
+                                     "head_rev": client.last_rev})
+            return
+        state = result.get("state")
+        if result.get("noop"):
+            await self.send(client, {"type": "ctrl_ack", "kind": direction,
+                                     "req_id": req_id, "noop": True})
+            await self._send_undo_state(client, state)
+            return
+        op = result["op"]
+        head_rev = int(op.get("rev") or client.last_rev)
+        client.last_rev = head_rev
+        # 逆操作进入环形缓冲(重连补发), 并广播给*包括发起者*在内的所有人:
+        # 发起者的本地状态也以服务端签发的这一份为准(跨设备一致)。
+        room.remember([op])
+        await self.broadcast(client.board_id, {
+            "type": "ops", "ops": [op], "head_rev": head_rev,
+            "by": username, "client_id": client.client_id,
+            "undo": True, "direction": direction, "req_id": req_id,
+        })
+        await self.send(client, {"type": "ctrl_ack", "kind": direction,
+                                 "req_id": req_id, "rev": head_rev,
+                                 **({"dup": True} if result.get("dup") else {})})
+        await self._send_undo_state(client, state)
+        snap_rev = await manager.maybe_snapshot(client.board_id)
+        if snap_rev:
+            await self.broadcast(client.board_id,
+                                 {"type": "snapshot_saved", "rev": snap_rev})
+
+    async def _send_undo_state(self, client: Client,
+                               state: Optional[Dict[str, Any]] = None) -> None:
+        """把该用户的撤销栈摘要推送给同一房间内属于该用户的所有连接
+        (同一用户多标签页/多设备都要同步按钮态; 摘要只有 gid/label)。"""
+        if state is None:
+            state = manager.undo_state(client.board_id,
+                                       client.user.get("username", ""))
+        room = self.rooms.get(client.board_id)
+        if room is None:
+            return
+        username = client.user.get("username")
+        for other in list(room.clients.values()):
+            if other.user.get("username") == username:
+                await self.send(other, {"type": "undo_state", "state": state})
 
     # ------------------------------------------------------------ 聊天
     async def _handle_chat(self, client: Client, msg: Dict[str, Any]) -> None:

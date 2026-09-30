@@ -24,6 +24,8 @@ from .models import (BoardCreateReq, BoardPatchReq, DuplicateReq,
                      PermissionsReq)
 from .storage import (now_ms, read_json, safe_id, write_json_atomic,
                       write_json_atomic_async)
+from .undo import (FOREIGN_SCAN_LIMIT, UNDO, clean_leaves, issue_inverse,
+                   plan_inverse, undo_service)
 
 router = APIRouter(prefix="/api/boards", tags=["boards"])
 
@@ -153,7 +155,7 @@ class BoardManager:
                 doc.import_state(snapshot)
             base_rev = doc.head_rev
             max_rev = base_rev
-            for raw in hist.iter_ops(from_rev=base_rev + 1):
+            for raw in hist.iter_ops(from_rev=base_rev):
                 clean = validate_op(raw)
                 if clean:
                     doc.apply_op(clean)
@@ -223,7 +225,10 @@ class BoardManager:
                 accepted.append(clean)
             if accepted:
                 hist = history_service.for_board(board_id)
-                stamped = [op for op in accepted if "rev" in op and op.get("type") != "move"]
+                # 所有新接入的操作(含 move)都落盘: 否则刷新/重连/换设备
+                # 后位移丢失, 撤销移动的逆 move 也无从补发。
+                stamped = [op for op in accepted
+                           if "rev" in op and not op.get("dup")]
                 await asyncio.get_running_loop().run_in_executor(
                     None, hist.append_ops, stamped)
                 meta = self.metas.get(board_id)
@@ -277,6 +282,110 @@ class BoardManager:
         self.pending_snapshot[board_id] = False
         return rev
 
+    # ------------------------------------------------------------ 服务端撤销
+    async def undo_checkpoint(self, board_id: str, username: str, gid: str,
+                              label: str, undo_raw: List[Any], redo_raw: List[Any],
+                              base_rev: int) -> Dict[str, Any]:
+        """登记一个撤销单元(原子提交或手势结束)。串行化 + 线程池落盘。"""
+        depth = int(config.get_settings().get("undo_history_depth") or 100)
+        async with undo_service.user_lock(board_id, username):
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, self._checkpoint_sync, board_id, username, gid, label,
+                undo_raw, redo_raw, base_rev, depth)
+
+    @staticmethod
+    def _checkpoint_sync(board_id: str, username: str, gid: str, label: str,
+                         undo_raw: List[Any], redo_raw: List[Any],
+                         base_rev: int, depth: int) -> Dict[str, Any]:
+        return undo_service.register(
+            board_id, username, gid, label,
+            clean_leaves(undo_raw), clean_leaves(redo_raw), base_rev, depth)
+
+    async def undo_or_redo(self, board_id: str, username: str, direction: str,
+                           req_id: str) -> Optional[Dict[str, Any]]:
+        """服务端执行撤销/重做: 弹栈 → 冲突过滤 → 签发逆操作 → 落盘广播。
+
+        返回 None 表示栈空; {"noop": True} 表示逆操作被并发冲突全部跳过;
+        正常返回 {"op": 已签发操作, "state": 新栈摘要, "dup": 是否重复请求}。
+        """
+        if direction not in ("undo", "redo"):
+            return None
+        # 1) 进程内幂等: 同 req_id 的重发直接回上次结果
+        cached = undo_service.cached_request(req_id)
+        if cached is not None:
+            _dir, op = cached
+            return {"op": op, "state": undo_service.state(board_id, username),
+                    "dup": True}
+
+        loop = asyncio.get_running_loop()
+        async with undo_service.user_lock(board_id, username):
+            # 2) 跨进程重启的幂等: 已签发过的逆操作记录在条目里
+            persisted = await loop.run_in_executor(
+                None, undo_service.find_issued, board_id, username, req_id)
+            if persisted is not None:
+                return {"op": persisted, "state": undo_service.state(board_id, username),
+                        "dup": True}
+
+            async with self.lock_for(board_id):
+                doc = await self.get_doc(board_id)
+                data, entry = await loop.run_in_executor(
+                    None, undo_service.pop, board_id, username, direction)
+                if not entry:
+                    return None
+                leaves_key = "undo" if direction == UNDO else "redo"
+                raw_leaves = entry.get(leaves_key) or []
+                base_rev = int(entry.get("base_rev") or 0)
+
+                if direction == UNDO:
+                    hist = history_service.for_board(board_id)
+                    # move 不参与冲突判定(增量可交换), 不占扫描额度
+                    ops_after = await loop.run_in_executor(
+                        None, lambda: hist.iter_ops(from_rev=base_rev,
+                                                    limit=FOREIGN_SCAN_LIMIT + 1,
+                                                    include_moves=False))
+                    truncated = len(ops_after) > FOREIGN_SCAN_LIMIT
+                    leaves = plan_inverse(ops_after[:FOREIGN_SCAN_LIMIT],
+                                          username, raw_leaves, truncated,
+                                          redo=False)
+                else:
+                    leaves = plan_inverse([], username, raw_leaves, False,
+                                          redo=True)
+
+                if not leaves:
+                    # 逆操作全部被并发冲突跳过: 栈保持原样(撤销单元仍在原位)
+                    undo_service.restore_popped(data, direction)
+                    state = await loop.run_in_executor(
+                        None, undo_service.commit, board_id, username, data)
+                    return {"noop": True, "state": state}
+
+                op = issue_inverse(doc, leaves, username)
+                if op is None:
+                    undo_service.restore_popped(data, direction)
+                    state = await loop.run_in_executor(
+                        None, undo_service.commit, board_id, username, data)
+                    return {"noop": True, "state": state}
+
+                hist = history_service.for_board(board_id)
+                await loop.run_in_executor(None, hist.append_ops, [op])
+                entry.setdefault("issued", {})[direction] = {
+                    "req_id": req_id, "op": op,
+                }
+                meta = self.metas.get(board_id)
+                if meta is not None:
+                    meta["updated_at"] = now_ms()
+                    stats = doc.stats()
+                    meta["stats"] = {"rev": stats["rev"], "shapes": len(doc.shapes)}
+                state = await loop.run_in_executor(
+                    None, undo_service.commit, board_id, username, data)
+                undo_service.remember_request(req_id, direction, op)
+                self.pending_snapshot[board_id] = True
+                self.touch(board_id)
+                return {"op": op, "state": state}
+
+    def undo_state(self, board_id: str, username: str) -> Dict[str, Any]:
+        return undo_service.state(board_id, username)
+
     # ------------------------------------------------------------ 创建/删除
     async def create_board(self, name: str, mode: str, owner: str,
                            template_id: Optional[str] = None,
@@ -328,6 +437,7 @@ class BoardManager:
         self.docs.pop(board_id, None)
         self.metas.pop(board_id, None)
         history_service.drop(board_id)
+        undo_service.drop_board(board_id)
         await asyncio.get_running_loop().run_in_executor(
             None, shutil.rmtree, config.board_dir(board_id), True)
         await self.save_meta(board_id)   # metas 已删 → 重写索引

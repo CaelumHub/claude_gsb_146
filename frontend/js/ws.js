@@ -5,8 +5,11 @@
    - 指数退避 + 抖动的自动重连;
    - last_rev 持久化到 localStorage: 刷新/断线重连后 hello 带上,
      服务端只补发错过的操作(ring → 磁盘 → 全量快照 三级降级);
-   - 「未 ack 操作队列」同样持久化: 断线期间产生的本地操作先入队,
-     重连后自动补发; 服务端按 op_id 幂等去重(dup ack), 不会重复生效;
+   - 有序「发件箱」outbox 同时容纳编辑操作(ops)与撤销控制消息
+     (undo_checkpoint/undo/redo), 严格 FIFO 发送 —— 这保证
+     「操作先于其 checkpoint」「撤销请求先于撤销后的新操作」的
+     服务端处理顺序; 断线期间的条目持久化, 重连后自动补发;
+     服务端按 op_id / req_id / gid 幂等去重, 不会重复生效;
    - 心跳: 应答服务端 ping, 且每 25s 主动 ping 一次, 60s 无任何
      消息则视为假死连接, 主动断开触发重连;
    - 事件分发: on(type, handler), 状态变化广播 wb:conn-status。
@@ -15,7 +18,7 @@ import { Api } from './api.js';
 
 const LS = {
   rev: (boardId) => `wb_rev_${boardId}`,
-  queue: (boardId) => `wb_pending_${boardId}`,
+  outbox: (boardId) => `wb_pending_${boardId}`,
   clientId: (boardId) => `wb_client_${boardId}`,
 };
 
@@ -40,6 +43,14 @@ export function getClientId(boardId) {
   return id;
 }
 
+/** 旧版本地撤销栈遗留的纯操作数组 → 新版有序发件箱条目 */
+function migrateOutbox(raw) {
+  if (!Array.isArray(raw)) return [];
+  if (raw.every((e) => e && (e.kind === 'ops' || e.kind === 'ctrl'))) return raw;
+  const ops = raw.filter(Boolean);
+  return ops.length ? [{ kind: 'ops', ops }] : [];
+}
+
 export class BoardSocket {
   /**
    * @param {string} boardId
@@ -58,7 +69,9 @@ export class BoardSocket {
     this.manualClose = false;
     this.retry = 0;
     this.lastRev = this.persist ? (lsGet(LS.rev(boardId), 0) || 0) : 0;
-    this.pending = this.persist ? (lsGet(LS.queue(boardId), []) || []) : [];
+    // 有序发件箱: [{kind:'ops', ops:[...]}, {kind:'ctrl', msg:{...}}]
+    this.outbox = this.persist ? migrateOutbox(lsGet(LS.outbox(boardId), [])) : [];
+    this.inFlight = null;            // 已发送待确认的队头条目
     this._handlers = {};
     this._pingTimer = null;
     this._watchdog = null;
@@ -185,7 +198,7 @@ export class BoardSocket {
         this._applyCatchup(msg.catchup.ops);
       }
       if (msg.head_rev != null) { this.lastRev = Math.max(this.lastRev, msg.head_rev); this._saveRev(); }
-      this._flushPending();
+      this._flushOutbox();
       this.emit('welcome', msg);
       return;
     }
@@ -197,11 +210,30 @@ export class BoardSocket {
     if (type === 'ack') {
       if (msg.head_rev != null) { this.lastRev = Math.max(this.lastRev, msg.head_rev); this._saveRev(); }
       const acked = new Set((msg.acks || []).map((a) => a.op_id));
-      this._removePending(acked);
+      this._resolveOpsAck(acked);
       this.emit('ack', msg);
       // 服务端单批最多接受 max_ops_per_batch 条, 剩余队列在此续排
-      this._flushPending();
+      this._flushOutbox();
       return;
+    }
+    if (type === 'ctrl_ack') {
+      this._resolveCtrlAck(msg);
+      this._flushOutbox();
+      this.emit('ctrl_ack', msg);
+      return;
+    }
+    if (type === 'undo_state') {
+      this.emit('undo_state', msg);
+      return;
+    }
+    if (type === 'error') {
+      // 队头被服务端拒绝时不要让发件箱永久卡死: 丢弃队头继续发送
+      if ((msg.code === 'invalid_op' || msg.code === 'undo_failed') && this.inFlight) {
+        this.inFlight = null;
+        this.outbox.shift();
+        this._saveOutbox();
+        this._flushOutbox();
+      }
     }
     if (type === 'ping') { this._send({ type: 'ping' }); return; }   // 服务端心跳 → 应答
     if (type === 'pong') return;
@@ -221,40 +253,78 @@ export class BoardSocket {
     if (this.persist) lsSet(LS.rev(this.boardId), this.lastRev);
   }
 
-  /* ------------------------------------------------------------ 操作发送 */
-  /** 发送一个(或一批)本地 CRDT 操作; 断线时进入持久化补发队列。 */
+  /* ------------------------------------------------------------ 发件箱 */
+  /** 发送一个(或一批)本地 CRDT 操作; 断线时进入持久化发件箱补发。 */
   sendOps(ops) {
     const list = Array.isArray(ops) ? ops : [ops];
     if (!list.length) return;
-    this.pending.push(...list);
-    this._savePending();
-    this._flushPending();
+    // 单条 WS 消息最多 64 个操作, 超出切片(保持 FIFO)
+    for (let i = 0; i < list.length; i += 64) {
+      this._enqueue({ kind: 'ops', ops: list.slice(i, i + 64) });
+    }
+    this._flushOutbox();
   }
 
   sendOp(op) { this.sendOps([op]); }
 
-  _flushPending() {
-    if (this.status !== 'open' || !this.pending.length) return;
-    const batch = this.pending.slice(0, 64);
-    const ok = this._send({ type: 'ops', ops: batch });
-    if (ok) this.emit('pending-flushed', { count: batch.length, remaining: this.pending.length - batch.length });
+  /** 入队一条撤销控制消息(checkpoint/undo/redo), 排在操作之后保序 */
+  sendControl(msg) {
+    if (!msg || typeof msg !== 'object') return;
+    this._enqueue({ kind: 'ctrl', msg });
+    this._flushOutbox();
   }
 
-  _removePending(ackedIds) {
-    if (!ackedIds?.size) return;
-    this.pending = this.pending.filter((op) => !ackedIds.has(op.op_id));
-    this._savePending();
+  _enqueue(entry) {
+    this.outbox.push(entry);
+    if (this.outbox.length > 500) this.outbox = this.outbox.slice(-500);
+    this._saveOutbox();
   }
 
-  _savePending() {
-    if (this.persist) {
-      // 队列只保留最近 500 条, 防 localStorage 膨胀
-      if (this.pending.length > 500) this.pending = this.pending.slice(-500);
-      lsSet(LS.queue(this.boardId), this.pending);
+  /** 严格 FIFO: 一次只发队头条目, 收到确认后再发下一条 */
+  _flushOutbox() {
+    if (this.status !== 'open' || this.inFlight || !this.outbox.length) return;
+    const entry = this.outbox[0];
+    const payload = entry.kind === 'ops'
+      ? { type: 'ops', ops: entry.ops }
+      : entry.msg;
+    if (this._send(payload)) {
+      this.inFlight = entry;
+      this.emit('pending-flushed', { remaining: this.outbox.length - 1 });
     }
   }
 
-  pendingCount() { return this.pending.length; }
+  _resolveOpsAck(ackedIds) {
+    const head = this.inFlight;
+    if (!head || head.kind !== 'ops' || !ackedIds.size) return;
+    const rest = head.ops.filter((op) => !ackedIds.has(op.op_id));
+    this.inFlight = null;
+    this.outbox.shift();
+    // 极少数(整条被拒)情况下保留未确认操作到队头, 下个周期重发,
+    // 已确认的服务端按 op_id 幂等去重, 不会二次生效。
+    if (rest.length) this.outbox.unshift({ kind: 'ops', ops: rest });
+    this._saveOutbox();
+  }
+
+  _resolveCtrlAck(msg) {
+    const head = this.inFlight;
+    if (!head || head.kind !== 'ctrl') return;
+    const want = head.msg;
+    let match = false;
+    if (msg.kind === 'checkpoint') match = want.type === 'undo_checkpoint' && want.gid === msg.gid;
+    else match = want.type === msg.kind && want.req_id === msg.req_id;
+    if (!match) return;
+    this.inFlight = null;
+    this.outbox.shift();
+    this._saveOutbox();
+  }
+
+  _saveOutbox() {
+    if (this.persist) lsSet(LS.outbox(this.boardId), this.outbox);
+  }
+
+  pendingCount() {
+    return this.outbox.length + (this.inFlight ? 1 : 0);
+  }
 
   /* ------------------------------------------------------------ 其他消息 */
   sendChat(text) { return this._send({ type: 'chat', text }); }
